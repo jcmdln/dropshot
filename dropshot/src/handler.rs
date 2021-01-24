@@ -43,6 +43,7 @@ use crate::api_description::ApiEndpointParameterLocation;
 use crate::api_description::ApiEndpointResponse;
 use crate::api_description::ApiSchemaGenerator;
 use crate::pagination::PaginationParams;
+use crate::pagination::PAGINATION_PARAM_SENTINEL;
 
 use async_trait::async_trait;
 use futures::lock::Mutex;
@@ -174,7 +175,16 @@ pub trait Extractor: Send + Sync + Sized {
         rqctx: Arc<RequestContext>,
     ) -> Result<Self, HttpError>;
 
-    fn metadata() -> Vec<ApiEndpointParameter>;
+    fn metadata() -> ExtractorMetadata;
+}
+
+/**
+ * Metadata associated with an extractor including parameters and whether or not
+ * the associated endpoint is paginated.
+ */
+pub struct ExtractorMetadata {
+    pub paginated: bool,
+    pub parameters: Vec<ApiEndpointParameter>,
 }
 
 /**
@@ -192,11 +202,17 @@ macro_rules! impl_extractor_for_tuple {
             Ok( ($($T::from_request(Arc::clone(&_rqctx)).await?,)* ) )
         }
 
-        fn metadata() -> Vec<ApiEndpointParameter> {
+        fn metadata() -> ExtractorMetadata {
             #[allow(unused_mut)]
-            let mut v = vec![];
-            $( v.append(&mut $T::metadata()); )*
-            v
+            let mut paginated = false;
+            #[allow(unused_mut)]
+            let mut parameters = vec![];
+            $(
+                let mut metadata = $T::metadata();
+                paginated = paginated | metadata.paginated;
+                parameters.append(&mut metadata.parameters);
+            )*
+            ExtractorMetadata { paginated, parameters }
         }
     }
 }}
@@ -568,8 +584,8 @@ where
         http_request_load_query(&request)
     }
 
-    fn metadata() -> Vec<ApiEndpointParameter> {
-        QueryType::metadata(&ApiEndpointParameterLocation::Query)
+    fn metadata() -> ExtractorMetadata {
+        get_metadata::<QueryType>(&ApiEndpointParameterLocation::Query)
     }
 }
 
@@ -615,44 +631,49 @@ where
         })
     }
 
-    fn metadata() -> Vec<ApiEndpointParameter> {
-        PathType::metadata(&ApiEndpointParameterLocation::Path)
+    fn metadata() -> ExtractorMetadata {
+        get_metadata::<PathType>(&ApiEndpointParameterLocation::Path)
     }
 }
 
 /**
- * Convenience trait to generate parameter metadata from types implementing
+ * Convenience function to generate parameter metadata from types implementing
  * `JsonSchema` for use with `Query` and `Path` `Extractors`.
  */
-pub(crate) trait GetMetadata {
-    fn metadata(
-        loc: &ApiEndpointParameterLocation,
-    ) -> Vec<ApiEndpointParameter>;
-}
-
-impl<ParamType> GetMetadata for ParamType
+fn get_metadata<ParamType>(
+    loc: &ApiEndpointParameterLocation,
+) -> ExtractorMetadata
 where
     ParamType: JsonSchema,
 {
-    fn metadata(
-        loc: &ApiEndpointParameterLocation,
-    ) -> Vec<ApiEndpointParameter> {
-        /*
-         * Generate the type for `ParamType` then pluck out each member of
-         * the structure to encode as an individual parameter.
-         */
-        let mut generator = schemars::gen::SchemaGenerator::new(
-            schemars::gen::SchemaSettings::openapi3().with(|settings| {
-                /*
-                 * Strip off any definitions prefix so that we can lookup
-                 * references simply. Ideally we would force no references to
-                 * be generated, but that doesn't seem to be an option.
-                 */
-                settings.definitions_path = String::new();
-            }),
-        );
-        let schema = ParamType::json_schema(&mut generator);
-        schema2parameters(loc, &schema, generator.definitions(), true)
+    /*
+     * Generate the type for `ParamType` then pluck out each member of
+     * the structure to encode as an individual parameter.
+     */
+    let mut generator = schemars::gen::SchemaGenerator::new(
+        schemars::gen::SchemaSettings::openapi3().with(|settings| {
+            /*
+             * Strip off any definitions prefix so that we can lookup
+             * references simply.
+             */
+            settings.definitions_path = String::new();
+        }),
+    );
+    let schema = ParamType::json_schema(&mut generator);
+    match &schema {
+        schemars::schema::Schema::Object(object) => ExtractorMetadata {
+            paginated: object
+                .extensions
+                .get(&PAGINATION_PARAM_SENTINEL.to_string())
+                .is_some(),
+            parameters: schema2parameters(
+                loc,
+                &schema,
+                generator.definitions(),
+                true,
+            ),
+        },
+        _ => panic!("unexpected catchall schema"),
     }
 }
 
@@ -707,7 +728,7 @@ fn schema2parameters(
             None => panic!("invalid reference {}", refstr),
         },
 
-        // Match objects and subschemas.
+        /* Match objects and subschemas. */
         schemars::schema::Schema::Object(schemars::schema::SchemaObject {
             metadata: _,
             // TODO: should be Some(schemars::schema::SingleOrVec::Single(_))
@@ -725,7 +746,7 @@ fn schema2parameters(
         }) => {
             let mut parameters = vec![];
 
-            // If there's a local object, add its members to the list of
+            // If there's a top-level object, add its members to the list of
             // parameters.
             if let Some(object) = object {
                 parameters.extend(object.properties.iter().map(
@@ -757,7 +778,8 @@ fn schema2parameters(
                         else_schema: None,
                     } => parameters.extend(schemas.iter().flat_map(
                         |subschema| {
-                            // Note that all these parameters will be optional.
+                            // Note that all these parameters will be optional
+                            // due to the semantics of "any_of".
                             schema2parameters(
                                 loc,
                                 subschema,
@@ -878,8 +900,8 @@ where
         http_request_load_json_body(rqctx).await
     }
 
-    fn metadata() -> Vec<ApiEndpointParameter> {
-        vec![ApiEndpointParameter::new_body(
+    fn metadata() -> ExtractorMetadata {
+        let body = ApiEndpointParameter::new_body(
             None,
             true,
             ApiSchemaGenerator::Gen {
@@ -887,7 +909,11 @@ where
                 schema: BodyType::json_schema,
             },
             vec![],
-        )]
+        );
+        ExtractorMetadata {
+            paginated: false,
+            parameters: vec![body],
+        }
     }
 }
 
@@ -1105,13 +1131,15 @@ impl From<HttpResponseUpdatedNoContent> for HttpHandlerResult {
 
 #[cfg(test)]
 mod test {
-    use super::GetMetadata;
     use crate::{
         api_description::ApiEndpointParameterName, ApiEndpointParameter,
         ApiEndpointParameterLocation, PaginationParams,
     };
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
+
+    use super::get_metadata;
+    use super::ExtractorMetadata;
 
     #[derive(Deserialize, Serialize, JsonSchema)]
     #[allow(dead_code)]
@@ -1138,12 +1166,18 @@ mod test {
         Next { page_token: String },
     }
 
-    fn compare(actual: Vec<ApiEndpointParameter>, expected: Vec<(&str, bool)>) {
+    fn compare(
+        actual: ExtractorMetadata,
+        paginated: bool,
+        parameters: Vec<(&str, bool)>,
+    ) {
+        assert_eq!(actual.paginated, paginated);
+
         /*
          * This is order-dependent. We might not really care if the order
          * changes, but it will be interesting to understand why if it does.
          */
-        actual.iter().zip(expected.iter()).for_each(
+        actual.parameters.iter().zip(parameters.iter()).for_each(
             |(param, (name, required))| {
                 if let ApiEndpointParameter {
                     name: ApiEndpointParameterName::Path(aname),
@@ -1152,7 +1186,7 @@ mod test {
                 } = param
                 {
                     assert_eq!(aname, name);
-                    assert_eq!(arequired, required);
+                    assert_eq!(arequired, required, "mismatched for {}", name);
                 } else {
                     panic!();
                 }
@@ -1162,15 +1196,15 @@ mod test {
 
     #[test]
     fn test_metadata_simple() {
-        let params = A::metadata(&ApiEndpointParameterLocation::Path);
+        let params = get_metadata::<A>(&ApiEndpointParameterLocation::Path);
         let expected = vec![("bar", true), ("baz", false), ("foo", true)];
 
-        compare(params, expected);
+        compare(params, false, expected);
     }
 
     #[test]
     fn test_metadata_flattened() {
-        let params = B::<A>::metadata(&ApiEndpointParameterLocation::Path);
+        let params = get_metadata::<B<A>>(&ApiEndpointParameterLocation::Path);
         let expected = vec![
             ("bar", true),
             ("baz", false),
@@ -1178,12 +1212,13 @@ mod test {
             ("limit", false),
         ];
 
-        compare(params, expected);
+        compare(params, false, expected);
     }
 
     #[test]
     fn test_metadata_flattened_enum() {
-        let params = B::<C<A>>::metadata(&ApiEndpointParameterLocation::Path);
+        let params =
+            get_metadata::<B<C<A>>>(&ApiEndpointParameterLocation::Path);
         let expected = vec![
             ("limit", false),
             ("bar", false),
@@ -1192,22 +1227,22 @@ mod test {
             ("page_token", false),
         ];
 
-        compare(params, expected);
+        compare(params, false, expected);
     }
 
     #[test]
     fn test_metadata_pagination() {
-        let params = PaginationParams::<A, A>::metadata(
+        let params = get_metadata::<PaginationParams<A, A>>(
             &ApiEndpointParameterLocation::Path,
         );
         let expected = vec![
-            ("limit", false),
-            ("page_token", false),
             ("bar", false),
             ("baz", false),
             ("foo", false),
+            ("limit", false),
+            ("page_token", false),
         ];
 
-        compare(params, expected);
+        compare(params, true, expected);
     }
 }

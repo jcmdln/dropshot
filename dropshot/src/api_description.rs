@@ -33,6 +33,7 @@ pub struct ApiEndpoint {
     pub response: ApiEndpointResponse,
     pub description: Option<String>,
     pub tags: Vec<String>,
+    pub paginated: bool,
 }
 
 impl<'a> ApiEndpoint {
@@ -47,15 +48,17 @@ impl<'a> ApiEndpoint {
         FuncParams: Extractor + 'static,
         ResponseType: HttpResponse + Send + Sync + 'static,
     {
+        let func_parameters = FuncParams::metadata();
         ApiEndpoint {
             operation_id: operation_id,
             handler: HttpRouteHandler::new(handler),
             method: method,
             path: path.to_string(),
-            parameters: FuncParams::metadata(),
+            parameters: func_parameters.parameters,
             response: ResponseType::metadata(),
             description: None,
             tags: vec![],
+            paginated: func_parameters.paginated,
         }
     }
 
